@@ -12,8 +12,10 @@ import { errorMessage, type UpdateServiceInput } from '@/lib/api';
 import { NODE_VERSIONS, getServicePlans } from '@/lib/catalog';
 import { formatMb } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { isSupportedNodeVersion, planAllowsAutoRestart, typeRequiresPort, type NodeVersion } from '@digitalycloud/shared';
+import { MESSAGES, isSupportedNodeVersion, normalizeSubdomain, planAllowsAutoRestart, planAllowsCustomSubdomain, typeRequiresPort, type NodeVersion } from '@digitalycloud/shared';
+import { useAuth } from '@/providers/auth-provider';
 import type { PlanId, Service } from '@/lib/types';
+import { DomainsSection } from './service-domains';
 import { useService } from './service-shell';
 
 function Section({ title, description, children }: { title: string; description: string; children: ReactNode }) {
@@ -28,7 +30,7 @@ function Section({ title, description, children }: { title: string; description:
   );
 }
 
-const formFrom = (s: Service) => ({ name: s.name, startCommand: s.startCommand, nodeVersion: s.nodeVersion as string, port: s.port ? String(s.port) : '', branch: s.branch ?? '' });
+const formFrom = (s: Service) => ({ name: s.name, startCommand: s.startCommand, nodeVersion: s.nodeVersion as string, port: s.port ? String(s.port) : '', publishDir: s.publishDir ?? '', branch: s.branch ?? '' });
 
 function GeneralSection({ service }: { service: Service }) {
   const { update } = useCloud();
@@ -46,6 +48,7 @@ function GeneralSection({ service }: { service: Service }) {
     if (form.startCommand !== current.startCommand) patch.startCommand = form.startCommand;
     if (form.nodeVersion !== current.nodeVersion) patch.nodeVersion = form.nodeVersion as NodeVersion;
     if (form.port !== current.port) patch.port = form.port ? +form.port : null;
+    if (form.publishDir !== current.publishDir) patch.publishDir = form.publishDir.trim() || null;
     if (form.branch !== current.branch) patch.branch = form.branch;
     setSaving(true);
     try {
@@ -81,24 +84,36 @@ function GeneralSection({ service }: { service: Service }) {
             disabled={service.source !== 'github'}
           />
         </div>
-        <div>
-          <label className="label" htmlFor="svc-command">
-            Start command
-          </label>
-          <input id="svc-command" className="input font-mono" value={form.startCommand} onChange={(e) => setForm({ ...form, startCommand: e.target.value })} />
-        </div>
-        <div>
-          <label className="label" htmlFor="svc-port">
-            Port
-          </label>
-          <input
-            id="svc-port"
-            className="input font-mono"
-            value={form.port}
-            placeholder={typeRequiresPort(service.type) ? '3000' : 'None'}
-            onChange={(e) => setForm({ ...form, port: e.target.value.replace(/\D/g, '') })}
-          />
-        </div>
+        {service.type === 'static' ? (
+          <div>
+            <label className="label" htmlFor="svc-publish">
+              Publish directory
+            </label>
+            <input id="svc-publish" className="input font-mono" value={form.publishDir} placeholder="Detect automatically" onChange={(e) => setForm({ ...form, publishDir: e.target.value })} />
+            <p className="mt-1.5 text-xs text-ink-500">The folder with your site’s index.html, e.g. dist or build.</p>
+          </div>
+        ) : (
+          <>
+            <div>
+              <label className="label" htmlFor="svc-command">
+                Start command
+              </label>
+              <input id="svc-command" className="input font-mono" value={form.startCommand} onChange={(e) => setForm({ ...form, startCommand: e.target.value })} />
+            </div>
+            <div>
+              <label className="label" htmlFor="svc-port">
+                Port
+              </label>
+              <input
+                id="svc-port"
+                className="input font-mono"
+                value={form.port}
+                placeholder={typeRequiresPort(service.type) ? '3000' : 'None'}
+                onChange={(e) => setForm({ ...form, port: e.target.value.replace(/\D/g, '') })}
+              />
+            </div>
+          </>
+        )}
         <div>
           <label className="label" htmlFor="svc-node">
             Node.js version
@@ -122,6 +137,71 @@ function GeneralSection({ service }: { service: Service }) {
           Save changes
         </Button>
       </div>
+    </Section>
+  );
+}
+
+/** The address on the platform domain: `{id}` by default, a chosen name on paid plans. */
+function AddressSection({ service }: { service: Service }) {
+  const { update } = useCloud();
+  const { can } = useAuth();
+  const toast = useToast();
+  const allowed = planAllowsCustomSubdomain(service.plan);
+  const writable = can('services.update');
+  const host = new URL(service.url!).host;
+  const suffix = host.slice(host.indexOf('.'));
+  const current = service.subdomain && allowed ? service.subdomain : service.id;
+  const [value, setValue] = useState(current);
+  const [saving, setSaving] = useState(false);
+  const normalized = normalizeSubdomain(value);
+  const error = normalized === false ? MESSAGES.subdomain : null;
+  const dirty = (normalized || service.id) !== current;
+
+  const save = async (subdomain: string | null) => {
+    setSaving(true);
+    try {
+      const updated = await update(service.id, { subdomain });
+      setValue(updated.subdomain ?? updated.id);
+      toast({ kind: 'success', title: 'Address updated', description: updated.url?.replace(/^https?:\/\//, '') });
+    } catch (e) {
+      toast({ kind: 'error', title: 'Address not changed', description: errorMessage(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Section title="Address" description="Where people reach this service. Paid plans can choose their own name.">
+      <div className="flex items-stretch overflow-hidden rounded-xl border border-white/[0.08] focus-within:border-brand-500/60">
+        <input
+          id="svc-subdomain"
+          aria-label="Address"
+          className="min-w-0 flex-1 bg-transparent px-3.5 py-2.5 font-mono text-sm text-white outline-none disabled:text-ink-400"
+          value={value}
+          disabled={!allowed || !writable}
+          onChange={(e) => setValue(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+        />
+        <span className="flex items-center border-l border-white/[0.08] bg-white/[0.03] px-3.5 font-mono text-sm text-ink-400">{suffix}</span>
+      </div>
+      {error && <p className="mt-1.5 text-xs text-danger-400">{error}</p>}
+      {!allowed && (
+        <p className="mt-3 text-sm text-ink-300">
+          Choosing your address is available on paid plans. Pick one in Resources above.
+          {service.subdomain && ` Your saved address “${service.subdomain}” comes back when you upgrade.`}
+        </p>
+      )}
+      {allowed && writable && (
+        <div className="mt-5 flex justify-end gap-2">
+          {service.subdomain && (
+            <Button variant="outline" onClick={() => void save(null)} disabled={saving}>
+              Use {service.id}
+            </Button>
+          )}
+          <Button onClick={() => void save(normalized || null)} disabled={!dirty || Boolean(error)} loading={saving}>
+            Save address
+          </Button>
+        </div>
+      )}
     </Section>
   );
 }
@@ -235,6 +315,8 @@ export function ServiceSettings() {
     <div className="space-y-4">
       <GeneralSection service={service} />
       <ResourcesSection key={service.plan} service={service} />
+      {service.url && <AddressSection key={`${service.plan}:${service.subdomain}`} service={service} />}
+      {service.port !== null && <DomainsSection service={service} />}
       <BehaviorSection service={service} />
 
       <div className="card grid gap-6 border-danger-500/20 p-6 lg:grid-cols-[280px_1fr]">

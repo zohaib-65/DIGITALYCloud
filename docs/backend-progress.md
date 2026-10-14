@@ -27,7 +27,20 @@ Decisions are in [backend-decisions.md](backend-decisions.md); endpoint/screen s
   dependencies: `migrate up`, `migrate status`, `indexes verify`, `seed`, API + worker start, health/readiness, CSRF
   rejection, cookie login, API-key bearer request, internal token gate, Prometheus metrics, route feed, SIGTERM drain.
 - Redis outage test: process survives, requests fail fast (≤1.5 s), readiness 503, automatic recovery.
-- Not verifiable here: `docker build`, `docker compose up`, real Docker runtime, Traefik, Stripe/Google/GitHub/SMTP/S3 live.
+- Not verifiable here: `docker build`, `docker compose up`, real Docker runtime, Traefik, Stripe/Google/GitHub/Brevo/S3 live.
+
+## Static sites and custom domains (2026-10-13)
+
+- Service type `static`: built from GitHub/upload with the normal Node build (install + `build` script when present), then a
+  second image stage keeps only the publish directory (`publishDir`, or the first of dist/build/out/public/_site with an
+  index.html, else the root) and the platform's dependency-free file server (`runtime/static-server.ts`, port 8080). Clean
+  URLs, custom 404.html or SPA fallback, gzip, ranges, ETags; dotfiles and node_modules never served. Verified by building
+  images and testing over HTTP locally. Plans: Static (free), Site €1.49, Site Pro €3.99, Agency €9.99.
+- Custom domains (`modules/domains`, collection `custom_domains`, migration 0003): paid plans, HTTP services, ≤ 5 per service,
+  TXT `_digitaly-verify.<host>` + CNAME (or A to `PUBLIC_EDGE_IPS` / ALIAS for root domains). Checked by `periodic.domains`;
+  verified domains get Traefik routers with the `domains` ACME resolver. DNS checks verified against real DNS; Traefik
+  routing and certificate issuance are not verifiable here.
+- Ops: 3 more Stripe prices (`static:starter|pro|business`), the `domains` resolver in Traefik, `PUBLIC_EDGE_IPS`.
 
 ## Known placeholders to remove
 
@@ -39,7 +52,7 @@ Decisions are in [backend-decisions.md](backend-decisions.md); endpoint/screen s
    Docker image; verify hardening (non-root, limits, disk quota), crash restarts, blue/green and rollback.
 2. Traefik with the route feed and a wildcard certificate.
 3. Stripe test mode: prices in `STRIPE_PRICES`, webhook endpoint, the flows listed in docs/operations.md §5.
-4. Google OAuth client and GitHub App against the real providers; SMTP (Mailpit, then the real provider); S3 (MinIO profile).
+4. Google OAuth client and GitHub App against the real providers; Brevo with a real API key and verified sender; S3 (MinIO profile).
 5. `docker build` / `docker compose up` (CI builds the backend image; not run locally).
 6. Branded OG image (`apps/frontend/config/site.ts`).
 

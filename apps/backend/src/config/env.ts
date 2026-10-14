@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 import { PLAN_LEVELS, SERVICE_TYPE_IDS } from '@digitalycloud/shared';
 
@@ -45,14 +46,14 @@ const schema = z.object({
   /** Express `trust proxy`: `false`, a hop count, or a comma-separated list of trusted addresses/subnets. */
   TRUST_PROXY: z.string().default('false'),
 
-  MONGODB_URI: z.string().min(1, 'MONGODB_URI is required'),
-  REDIS_URL: z.string().min(1, 'REDIS_URL is required'),
+  MONGODB_URI: z.string({ error: 'MONGODB_URI is required' }),
+  REDIS_URL: z.string({ error: 'REDIS_URL is required' }),
   REDIS_PREFIX: z.string().default('dgc'),
   /** `kid:base64(32 bytes)` pairs, comma-separated. The primary id encrypts; all ids decrypt (rotation). */
-  ENCRYPTION_KEYS: z.string().min(1, 'ENCRYPTION_KEYS is required'),
-  ENCRYPTION_PRIMARY_KEY_ID: z.string().min(1, 'ENCRYPTION_PRIMARY_KEY_ID is required'),
+  ENCRYPTION_KEYS: z.string({ error: 'ENCRYPTION_KEYS is required' }),
+  ENCRYPTION_PRIMARY_KEY_ID: z.string({ error: 'ENCRYPTION_PRIMARY_KEY_ID is required' }),
   /** HMAC root secret for CSRF tokens, OAuth bindings and IP hashing. ≥ 32 characters. */
-  APP_SECRET: z.string().min(32, 'APP_SECRET must be at least 32 characters'),
+  APP_SECRET: z.string({ error: 'APP_SECRET is required' }).min(32, 'APP_SECRET must be at least 32 characters'),
 
   GOOGLE_CLIENT_ID: optional,
   GOOGLE_CLIENT_SECRET: optional,
@@ -74,8 +75,12 @@ const schema = z.object({
   STRIPE_PRICES: optional,
   STRIPE_AUTOMATIC_TAX: bool(false),
 
-  SMTP_URL: optional,
-  MAIL_FROM: z.string().default('DIGITALYCloud <no-reply@digitaly.fr>'),
+  /** Brevo API key (xkeysib-…). Empty = no email is sent. */
+  BREVO_API_KEY: optional,
+  /** Sender shown on emails; must be a sender or domain verified in Brevo. */
+  BREVO_SENDER_EMAIL: z.email({ error: 'BREVO_SENDER_EMAIL must be an email address' }).default('no-reply@digitaly.fr'),
+  BREVO_SENDER_NAME: z.string().default('DIGITALYCloud'),
+  /** Receives support tickets and contact-form messages. */
   SUPPORT_INBOX: z.email().default('support@digitaly.fr'),
 
   STORAGE_DRIVER: z.enum(['s3', 'filesystem', '']).optional(),
@@ -94,9 +99,11 @@ const schema = z.object({
   UPLOAD_TMP_DIR: z.string().default(''),
 
   RUNTIME_DRIVER: z.enum(['docker', 'disabled']).default('disabled'),
-  PUBLIC_RUNTIME_DOMAIN: z.string().default('digitaly.app'),
+  PUBLIC_RUNTIME_DOMAIN: z.string().default('digitalycloud.com'),
   PUBLIC_RUNTIME_SCHEME: z.enum(['https', 'http']).default('https'),
   PUBLIC_RUNTIME_PORT: optional,
+  /** Public IPs of the proxy edge, comma-separated: shown as A records for root custom domains. */
+  PUBLIC_EDGE_IPS: optional,
   REGISTRY_URL: optional,
   REGISTRY_USERNAME: optional,
   REGISTRY_PASSWORD: optional,
@@ -150,11 +157,16 @@ function parseTrustProxy(v: string): boolean | number | string[] {
   return v.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function group(raw: RawEnv, keys: (keyof RawEnv)[], name: string, errors: string[]) {
+/**
+ * An optional integration is on only when every variable of its group is set. A partly filled group
+ * doesn't stop the server: the integration stays off (its features answer "not configured") and a
+ * warning names the missing variables.
+ */
+function group(raw: RawEnv, keys: (keyof RawEnv)[], name: string, warnings: string[]) {
   const set = keys.filter((k) => raw[k] !== undefined && raw[k] !== '');
   if (set.length === 0) return false;
   if (set.length !== keys.length) {
-    errors.push(`${name} is partially configured: missing ${keys.filter((k) => !set.includes(k)).join(', ')}`);
+    warnings.push(`${name} is disabled until these are set: ${keys.filter((k) => !set.includes(k)).join(', ')}`);
     return false;
   }
   return true;
@@ -173,13 +185,16 @@ function parseJsonObject(value: string | undefined, name: string, errors: string
 }
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
-  const parsed = schema.safeParse(source);
+  // An empty value means "not set", so `PORT=` in .env behaves like no line at all and the default applies.
+  const present = Object.fromEntries(Object.entries(source).filter(([, v]) => v !== undefined && v.trim() !== ''));
+  const parsed = schema.safeParse(present);
   if (!parsed.success) {
     const msg = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('\n  ');
     throw new Error(`Invalid configuration:\n  ${msg}`);
   }
   const raw = parsed.data;
   const errors: string[] = [];
+  const warnings: string[] = [];
   const production = raw.NODE_ENV === 'production';
 
   const keyRing = (() => {
@@ -212,21 +227,30 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
     errors.push((e as Error).message);
   }
 
-  const google = group(raw, ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'], 'Google OAuth', errors);
-  const github = group(raw, ['GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'GITHUB_WEBHOOK_SECRET', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET'], 'GitHub App', errors);
-  const stripe = group(raw, ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICES'], 'Stripe', errors);
-  const email = Boolean(raw.SMTP_URL);
+  const google = group(raw, ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'], 'Google OAuth', warnings);
+  const github = group(raw, ['GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'GITHUB_WEBHOOK_SECRET', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET'], 'GitHub App', warnings);
+  let stripe = group(raw, ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICES'], 'Stripe', warnings);
+  const email = Boolean(raw.BREVO_API_KEY);
+  if (raw.BREVO_API_KEY && !raw.BREVO_API_KEY.startsWith('xkeysib-')) {
+    errors.push('BREVO_API_KEY must be a Brevo API key (xkeysib-…). SMTP keys (xsmtpsib-…) do not work with the API');
+  }
   const storageDriver = raw.STORAGE_DRIVER || (raw.S3_BUCKET ? 's3' : production ? undefined : 'filesystem');
   const storage =
-    storageDriver === 'filesystem' ? true : storageDriver === 's3' ? group(raw, ['S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY'], 'S3 storage', errors) : false;
+    storageDriver === 'filesystem' ? true : storageDriver === 's3' ? group(raw, ['S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY'], 'S3 storage', warnings) : false;
   const runtime = raw.RUNTIME_DRIVER === 'docker';
 
-  const stripePrices = parseJsonObject(raw.STRIPE_PRICES, 'STRIPE_PRICES', errors);
+  const priceProblems: string[] = [];
+  const stripePrices = parseJsonObject(raw.STRIPE_PRICES, 'STRIPE_PRICES', priceProblems);
   if (stripe) {
-    for (const t of SERVICE_TYPE_IDS)
-      for (const p of PLAN_LEVELS.slice(1)) if (!stripePrices[`${t}:${p}`]) errors.push(`STRIPE_PRICES is missing ${t}:${p}`);
+    for (const t of SERVICE_TYPE_IDS) for (const p of PLAN_LEVELS.slice(1)) if (!stripePrices[`${t}:${p}`]) priceProblems.push(`missing ${t}:${p}`);
+    if (priceProblems.length) {
+      warnings.push(`Stripe is disabled until STRIPE_PRICES is complete: ${priceProblems.join(', ')}`);
+      stripe = false;
+    }
   }
   const nodeImages = { '24': 'node:24-alpine', '22': 'node:22-alpine', ...parseJsonObject(raw.RUNTIME_NODE_IMAGES, 'RUNTIME_NODE_IMAGES', errors) };
+  const edgeIps = (raw.PUBLIC_EDGE_IPS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  for (const ip of edgeIps) if (!isIP(ip)) errors.push(`PUBLIC_EDGE_IPS has an invalid IP address: ${ip}`);
 
   const capabilities: Record<Capability, boolean> = { google, github, stripe, email, storage, runtime };
   const required = raw.REQUIRED_CAPABILITIES.length ? raw.REQUIRED_CAPABILITIES : production ? ['email', 'storage', 'runtime'] : [];
@@ -235,7 +259,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
     else if (!capabilities[c as Capability]) errors.push(`Required capability "${c}" is not configured`);
   }
 
-  if (errors.length) throw new Error(`Invalid configuration:\n  ${errors.join('\n  ')}`);
+  if (errors.length) throw new Error(`Invalid configuration:\n  ${[...errors, ...warnings].join('\n  ')}`);
 
   return {
     ...raw,
@@ -246,9 +270,12 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
     trustProxy,
     capabilities,
     requiredCapabilities: required as Capability[],
+    /** Partly configured optional integrations (logged at startup; those integrations stay off). */
+    warnings,
     storageDriver: storageDriver as 's3' | 'filesystem' | undefined,
     stripePrices,
     nodeImages: nodeImages as Record<string, string>,
+    edgeIps,
     googleRedirectUri: raw.GOOGLE_REDIRECT_URI ?? `${raw.API_PUBLIC_URL.replace(/\/$/, '')}/v1/auth/google/callback`,
   };
 }

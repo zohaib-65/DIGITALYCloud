@@ -17,7 +17,7 @@ Users sign up, create a **service** in a 5-step wizard, and it deploys. From the
 | ----------------- | ------------------------------------------------------------- |
 | Production site   | `https://cloud.digitaly.fr` (`NEXT_PUBLIC_SITE_URL`)          |
 | Public API (docs) | `https://api.cloud.digitaly.fr/v1` (see `data/docs/platform.tsx`) |
-| Service URLs      | `https://{serviceId}.digitaly.app` (only services with a port) |
+| Service URLs      | `https://{serviceId}.digitalycloud.com` (only services with a port) |
 | Currency          | EUR, VAT included, billed monthly, prorated                   |
 | Support email     | `support@digitaly.fr`                                         |
 | Repository        | `github.com/DIGITALYCompany/DIGITALYCloud`                    |
@@ -157,7 +157,7 @@ There are **two separate role systems**. Don't mix them up:
 | Runtime   | Docker containers on DIGITALY servers (Docker Engine API over mTLS), Traefik routing |
 | Real-time | Server-Sent Events backed by Redis Streams + Pub/Sub |
 | Payments  | Stripe (Checkout, subscription items with proration, Customer Portal, invoices, webhooks) |
-| Email     | SMTP (Mailpit locally) |
+| Email     | Brevo (transactional email API) |
 | Auth      | HttpOnly session cookie + CSRF token (dashboard), Bearer API keys (public API), Google OIDC, TOTP 2FA |
 
 Details and reasons are in [06-backend-guide.md](06-backend-guide.md) and [backend-decisions.md](backend-decisions.md).
